@@ -1,0 +1,536 @@
+name: Deploy python to EKS
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: firsteks2
+  APP_NAME: python
+  ECR_REPOSITORY: firsteks2-python
+  EKS_CLUSTER_NAME: firsteks2-cluster
+  IMAGE_TAG: ${{ github.sha }}
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  provision:
+    name: Provision EKS Infrastructure
+    runs-on: ubuntu-latest
+    outputs:
+      cluster_name: ${{ steps.cluster_info.outputs.cluster_name }}
+      ecr_registry: ${{ steps.ecr_info.outputs.ecr_registry }}
+      cluster_endpoint: ${{ steps.cluster_info.outputs.cluster_endpoint }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform Plan
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var="region=${{ env.AWS_REGION }}" \
+            -var="project_name=${{ env.PROJECT_NAME }}" \
+            -var="cluster_name=${{ env.EKS_CLUSTER_NAME }}" \
+            -out=tfplan
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: |
+          terraform apply -auto-approve tfplan
+
+      - name: Get cluster info
+        id: cluster_info
+        working-directory: terraform
+        run: |
+          CLUSTER_NAME=$(terraform output -raw cluster_name 2>/dev/null || echo "${{ env.EKS_CLUSTER_NAME }}")
+          CLUSTER_ENDPOINT=$(terraform output -raw cluster_endpoint 2>/dev/null || echo "")
+          echo "cluster_name=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
+          echo "cluster_endpoint=${CLUSTER_ENDPOINT}" >> $GITHUB_OUTPUT
+
+      - name: Get ECR registry info
+        id: ecr_info
+        run: |
+          ECR_REGISTRY=$(aws ecr describe-repositories \
+            --repository-names ${{ env.ECR_REPOSITORY }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'repositories[0].repositoryUri' \
+            --output text 2>/dev/null | sed 's|/.*||' || \
+            echo "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com")
+          echo "ecr_registry=${ECR_REGISTRY}" >> $GITHUB_OUTPUT
+
+      - name: Create ECR repository if not exists
+        run: |
+          aws ecr describe-repositories \
+            --repository-names ${{ env.ECR_REPOSITORY }} \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || \
+          aws ecr create-repository \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --region ${{ env.AWS_REGION }} \
+            --image-scanning-configuration scanOnPush=true
+
+  configure:
+    name: Build, Push and Deploy
+    runs-on: ubuntu-latest
+    needs: provision
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set ECR registry
+        id: set-registry
+        run: |
+          ECR_REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          if [ -z "${ECR_REGISTRY}" ]; then
+            ECR_REGISTRY="${{ needs.provision.outputs.ecr_registry }}"
+          fi
+          echo "ecr_registry=${ECR_REGISTRY}" >> $GITHUB_OUTPUT
+          echo "image_uri=${ECR_REGISTRY}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg PYTHON_VERSION=${{ env.PYTHON_VERSION }} \
+            --build-arg APP_PORT=8000 \
+            -t ${{ steps.set-registry.outputs.image_uri }} \
+            -t ${{ steps.set-registry.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY }}:latest \
+            .
+
+      - name: Push Docker image to ECR
+        run: |
+          docker push ${{ steps.set-registry.outputs.image_uri }}
+          docker push ${{ steps.set-registry.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: latest
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ needs.provision.outputs.cluster_name || env.EKS_CLUSTER_NAME }}
+
+      - name: Install ALB Ingress Controller
+        run: |
+          # Check if AWS Load Balancer Controller is already installed
+          if ! kubectl get deployment -n kube-system aws-load-balancer-controller 2>/dev/null; then
+            echo "Installing AWS Load Balancer Controller..."
+
+            # Create IAM policy if it does not exist
+            aws iam create-policy \
+              --policy-name AWSLoadBalancerControllerIAMPolicy \
+              --policy-document file://k8s/alb-iam-policy.json 2>/dev/null || \
+              echo "IAM policy already exists, continuing..."
+
+            # Install via Helm
+            helm repo add eks https://aws.github.io/eks-charts
+            helm repo update
+
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+            CLUSTER_NAME="${{ needs.provision.outputs.cluster_name || env.EKS_CLUSTER_NAME }}"
+
+            helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+              -n kube-system \
+              --set clusterName=${CLUSTER_NAME} \
+              --set serviceAccount.create=true \
+              --set serviceAccount.name=aws-load-balancer-controller \
+              --set region=${{ env.AWS_REGION }} \
+              --set vpcId=$(aws eks describe-cluster \
+                --name ${CLUSTER_NAME} \
+                --query "cluster.resourcesVpcConfig.vpcId" \
+                --output text) \
+              --wait \
+              --timeout=5m
+          else
+            echo "AWS Load Balancer Controller already installed"
+          fi
+
+      - name: Create Kubernetes namespace
+        run: |
+          kubectl create namespace ${{ env.PROJECT_NAME }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create Kubernetes secrets
+        run: |
+          kubectl create secret generic ${{ env.APP_NAME }}-secrets \
+            --namespace=${{ env.PROJECT_NAME }} \
+            --from-literal=DATABASE_URL="${{ secrets.DATABASE_URL }}" \
+            --from-literal=SECRET_KEY="${{ secrets.SECRET_KEY }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy to Kubernetes
+        run: |
+          ECR_REGISTRY="${{ steps.set-registry.outputs.ecr_registry }}"
+          IMAGE_URI="${ECR_REGISTRY}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          NAMESPACE="${{ env.PROJECT_NAME }}"
+          APP_NAME="${{ env.APP_NAME }}"
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${APP_NAME}
+            namespace: ${NAMESPACE}
+            labels:
+              app: ${APP_NAME}
+              version: "${{ env.IMAGE_TAG }}"
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: ${APP_NAME}
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxSurge: 1
+                maxUnavailable: 0
+            template:
+              metadata:
+                labels:
+                  app: ${APP_NAME}
+                  version: "${{ env.IMAGE_TAG }}"
+              spec:
+                containers:
+                  - name: ${APP_NAME}
+                    image: ${IMAGE_URI}
+                    imagePullPolicy: Always
+                    ports:
+                      - containerPort: 8000
+                        protocol: TCP
+                    command:
+                      - gunicorn
+                      - app.main:app
+                      - -k
+                      - uvicorn.workers.UvicornWorker
+                      - -w
+                      - "4"
+                      - -b
+                      - 0.0.0.0:8000
+                    env:
+                      - name: PORT
+                        value: "8000"
+                      - name: ENVIRONMENT
+                        value: "production"
+                      - name: DATABASE_URL
+                        valueFrom:
+                          secretKeyRef:
+                            name: ${APP_NAME}-secrets
+                            key: DATABASE_URL
+                            optional: true
+                      - name: SECRET_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: ${APP_NAME}-secrets
+                            key: SECRET_KEY
+                            optional: true
+                    livenessProbe:
+                      httpGet:
+                        path: /health
+                        port: 8000
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                      timeoutSeconds: 5
+                      failureThreshold: 3
+                    readinessProbe:
+                      httpGet:
+                        path: /health
+                        port: 8000
+                      initialDelaySeconds: 15
+                      periodSeconds: 5
+                      timeoutSeconds: 3
+                      failureThreshold: 3
+                    resources:
+                      requests:
+                        cpu: "250m"
+                        memory: "256Mi"
+                      limits:
+                        cpu: "500m"
+                        memory: "512Mi"
+                restartPolicy: Always
+          EOF
+
+      - name: Apply Kubernetes Service
+        run: |
+          NAMESPACE="${{ env.PROJECT_NAME }}"
+          APP_NAME="${{ env.APP_NAME }}"
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${APP_NAME}-service
+            namespace: ${NAMESPACE}
+            labels:
+              app: ${APP_NAME}
+          spec:
+            type: ClusterIP
+            selector:
+              app: ${APP_NAME}
+            ports:
+              - name: http
+                protocol: TCP
+                port: 80
+                targetPort: 8000
+          EOF
+
+      - name: Apply ALB Ingress
+        run: |
+          NAMESPACE="${{ env.PROJECT_NAME }}"
+          APP_NAME="${{ env.APP_NAME }}"
+          CLUSTER_NAME="${{ needs.provision.outputs.cluster_name || env.EKS_CLUSTER_NAME }}"
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: ${APP_NAME}-ingress
+            namespace: ${NAMESPACE}
+            annotations:
+              kubernetes.io/ingress.class: alb
+              alb.ingress.kubernetes.io/scheme: internet-facing
+              alb.ingress.kubernetes.io/target-type: ip
+              alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+              alb.ingress.kubernetes.io/healthcheck-path: /health
+              alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+              alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+              alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+              alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+              alb.ingress.kubernetes.io/tags: "Project=${{ env.PROJECT_NAME }},App=${APP_NAME},ManagedBy=github-actions"
+          spec:
+            rules:
+              - http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: ${APP_NAME}-service
+                          port:
+                            number: 80
+          EOF
+
+      - name: Wait for deployment rollout
+        run: |
+          kubectl rollout status deployment/${{ env.APP_NAME }} \
+            --namespace=${{ env.PROJECT_NAME }} \
+            --timeout=300s
+
+      - name: Get ALB DNS name
+        id: alb_dns
+        run: |
+          echo "Waiting for ALB to be provisioned..."
+          for i in $(seq 1 30); do
+            ALB_DNS=$(kubectl get ingress ${{ env.APP_NAME }}-ingress \
+              --namespace=${{ env.PROJECT_NAME }} \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+            if [ -n "${ALB_DNS}" ]; then
+              echo "ALB DNS: ${ALB_DNS}"
+              echo "alb_dns=${ALB_DNS}" >> $GITHUB_OUTPUT
+              break
+            fi
+            echo "Attempt ${i}/30 - Waiting for ALB DNS..."
+            sleep 10
+          done
+
+  verify:
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: latest
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ needs.provision.outputs.cluster_name || env.EKS_CLUSTER_NAME }}
+
+      - name: Verify pods are running
+        run: |
+          echo "Checking pod status..."
+          kubectl get pods --namespace=${{ env.PROJECT_NAME }} -l app=${{ env.APP_NAME }}
+
+          READY_PODS=$(kubectl get pods \
+            --namespace=${{ env.PROJECT_NAME }} \
+            -l app=${{ env.APP_NAME }} \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[*].metadata.name}' | wc -w)
+
+          echo "Ready pods: ${READY_PODS}"
+          if [ "${READY_PODS}" -lt "1" ]; then
+            echo "ERROR: No running pods found"
+            kubectl describe pods --namespace=${{ env.PROJECT_NAME }} -l app=${{ env.APP_NAME }}
+            exit 1
+          fi
+
+      - name: Get ALB DNS for health check
+        id: get_alb
+        run: |
+          ALB_DNS=$(kubectl get ingress ${{ env.APP_NAME }}-ingress \
+            --namespace=${{ env.PROJECT_NAME }} \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          echo "alb_dns=${ALB_DNS}" >> $GITHUB_OUTPUT
+          echo "ALB DNS: ${ALB_DNS}"
+
+      - name: Health check via ALB
+        run: |
+          ALB_DNS="${{ steps.get_alb.outputs.alb_dns }}"
+
+          if [ -z "${ALB_DNS}" ]; then
+            echo "ALB DNS not yet available, skipping external health check"
+            echo "Using pod-level health check instead..."
+            POD_NAME=$(kubectl get pods \
+              --namespace=${{ env.PROJECT_NAME }} \
+              -l app=${{ env.APP_NAME }} \
+              -o jsonpath='{.items[0].metadata.name}')
+            kubectl exec ${POD_NAME} \
+              --namespace=${{ env.PROJECT_NAME }} \
+              -- curl -sf http://localhost:8000/health
+            echo "Pod-level health check passed"
+          else
+            echo "Waiting for ALB to become healthy..."
+            for i in $(seq 1 20); do
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                --connect-timeout 10 \
+                --max-time 15 \
+                "http://${ALB_DNS}/health" || echo "000")
+              echo "Attempt ${i}/20 - HTTP Status: ${HTTP_CODE}"
+              if [ "${HTTP_CODE}" = "200" ]; then
+                echo "Health check passed with HTTP 200"
+                break
+              fi
+              if [ "${i}" = "20" ]; then
+                echo "ERROR: Health check failed after 20 attempts"
+                exit 1
+              fi
+              sleep 15
+            done
+          fi
+
+      - name: Show deployment summary
+        run: |
+          echo "=========================================="
+          echo "  Deployment Summary"
+          echo "=========================================="
+          echo "Project     : ${{ env.PROJECT_NAME }}"
+          echo "Application : ${{ env.APP_NAME }}"
+          echo "Image Tag   : ${{ env.IMAGE_TAG }}"
+          echo "Namespace   : ${{ env.PROJECT_NAME }}"
+          echo "Cluster     : ${{ needs.provision.outputs.cluster_name || env.EKS_CLUSTER_NAME }}"
+          echo "Region      : ${{ env.AWS_REGION }}"
+          echo "------------------------------------------"
+          kubectl get all --namespace=${{ env.PROJECT_NAME }}
+          echo "=========================================="
+
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [provision, verify]
+    if: always()
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: latest
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ needs.provision.outputs.cluster_name || env.EKS_CLUSTER_NAME }}
+
+      - name: Get final ALB endpoint
+        id: final_alb
+        run: |
+          ALB_DNS=$(kubectl get ingress ${{ env.APP_NAME }}-ingress \
+            --namespace=${{ env.PROJECT_NAME }} \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+          echo "alb_dns=${ALB_DNS}" >> $GITHUB_OUTPUT
+
+      - name: Deployment success notification
+        if: needs.verify.result == 'success'
+        run: |
+          echo "=========================================="
+          echo "  DEPLOYMENT SUCCESSFUL"
+          echo "=========================================="
+          echo "Project     : ${{ env.PROJECT_NAME }}"
+          echo "Application : ${{ env.APP_NAME }}"
+          echo "Image Tag   : ${{ env.IMAGE_TAG }}"
+          echo "Cluster     : ${{ needs.provision.outputs.cluster_name || env.EKS_CLUSTER_NAME }}"
+          echo "Region      : ${{ env.AWS_REGION }}"
+          echo "Endpoint    : http://${{ steps.final_alb.outputs.alb_dns }}"
+          echo "Health URL  : http://${{ steps.final_alb.outputs.alb_dns }}/health"
+          echo "=========================================="
+
+      - name: Deployment failure notification
+        if: needs.verify.result != 'success'
+        run: |
+          echo "=========================================="
+          echo "  DEPLOYMENT FAILED"
+          echo "=========================================="
+          echo "Project     : ${{ env.PROJECT_NAME }}"
+          echo "Application : ${{ env.APP_NAME }}"
+          echo "Image Tag   : ${{ env.IMAGE_TAG }}"
+          echo "Cluster     : ${{ needs.provision.outputs.cluster_name || env.EKS_CLUSTER_NAME }}"
+          echo "Region      : ${{ env.AWS_REGION }}"
+          echo "Please check the workflow logs for details."
+          echo "=========================================="
+          exit 1
